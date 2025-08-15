@@ -9,6 +9,7 @@ import seaborn as sns
 import networkx as nx
 import pandas as pd
 import os
+from collections import deque, defaultdict
 
 class OperationCounter:
     def __init__(self):
@@ -32,6 +33,19 @@ def generate_random_graph(num_vertices: int, num_edges: int, weight_range: Tuple
             v = random.randint(0, num_vertices - 1)
         w = random.uniform(*weight_range)
         graph.add_edge(u, v, w)
+    return graph
+
+def generate_strongly_connected_graph(num_vertices: int, num_edges: int, weight_range=(1.0, 10.0)) -> DirectedGraph:
+    graph = DirectedGraph()
+    # D'abord, créer un cycle pour assurer la connexité
+    for i in range(num_vertices):
+        graph.add_edge(i, (i+1) % num_vertices, random.uniform(*weight_range))
+    # Puis ajouter des arêtes aléatoires supplémentaires
+    for _ in range(num_edges - num_vertices):
+        u = random.randint(0, num_vertices - 1)
+        v = random.randint(0, num_vertices - 1)
+        if u != v:
+            graph.add_edge(u, v, random.uniform(*weight_range))
     return graph
 
 def dijkstra(graph: DirectedGraph, source: int) -> Dict[int, float]:
@@ -123,134 +137,98 @@ def get_shortest_path(distances: Dict[int, float], graph: DirectedGraph, source:
             return []  # No path found
     return list(reversed(path))
 
-def frontier_reduction_sssp_instrumented(graph: DirectedGraph, source: int, counter: OperationCounter, k: int = 5) -> Dict[int, float]:
-    # Version inspirée du papier : partitionnement, passes Bellman-Ford sur sous-ensembles, réduction de la frontier
-    # (Ceci reste une version illustrative, la version exacte du papier est très complexe à coder en quelques lignes)
-    distances = {v: float('inf') for v in graph.get_vertices()}
-    distances[source] = 0.0
-    n = len(graph.get_vertices())
-    m = sum(len(graph.get_neighbors(u)) for u in graph.get_vertices())
-    # On partitionne les sommets en k groupes pour simuler la réduction de frontier
-    vertices = graph.get_vertices()
-    group_size = max(1, n // k)
-    groups = [vertices[i*group_size:(i+1)*group_size] for i in range(k)]
-    for group in groups:
-        for _ in range(k):
-            updated = False
-            for u in group:
-                for v, weight in graph.get_neighbors(u):
-                    counter.comparisons += 1
-                    if distances[u] + weight < distances[v]:
-                        counter.relaxations += 1
-                        distances[v] = distances[u] + weight
-                        updated = True
-            if not updated:
-                break
-    return distances
-
-def sssp_frontier_reduction(
+def sssp_frontier_reduction_paper(
     graph: DirectedGraph,
     source: int,
     counter: OperationCounter,
-    vertices: list[int] = None,
     distances: dict = None,
-    upper_bound: float = float('inf'),
+    S: set = None,
+    B: float = float('inf'),
     log_power: float = 2/3,
     recursion_depth: int = 0,
-    max_depth: int = 10
+    max_depth: int = 8
 ) -> dict:
     """
-    Implémentation instrumentée et récursive de l'algorithme "Frontier Reduction" du papier
-    "Breaking the Sorting Barrier for Directed Single-Source Shortest Paths" (Duan et al., 2025).
-
-    Étapes principales :
-    1. **Initialisation** : On part d'un ensemble de sommets (par défaut tous les sommets du graphe) et d'une estimation des distances (par défaut, source à 0, le reste à +inf).
-    2. **Choix du paramètre k** : On fixe k = ceil(log(n) ** log_power), ce qui détermine la granularité du partitionnement et le nombre de passes Bellman-Ford.
-    3. **Partitionnement** : On partitionne les sommets selon leur distance estimée en k intervalles (buckets) de tailles égales.
-    4. **Relaxations locales** : Pour chaque intervalle, on effectue k passes Bellman-Ford sur les sommets de l’intervalle, ce qui permet de raffiner localement les estimations de distance.
-    5. **Sélection des pivots** : Dans chaque intervalle, on sélectionne les sommets ayant les plus petites distances (pivots) pour réduire la taille de la frontier.
-    6. **Récursivité** : On appelle récursivement l’algorithme sur chaque sous-ensemble défini par les intervalles, avec une borne supérieure adaptée.
-    7. **Instrumentation** : Toutes les opérations importantes (comparaisons, relaxations) sont comptabilisées via le paramètre `counter`.
-
-    L'objectif de cette approche est de réduire le coût de tri (sorting barrier) inhérent à Dijkstra, en limitant la taille de la frontier à chaque étape, ce qui permet d'obtenir une complexité en O(m log^{2/3} n) sur les graphes dirigés pondérés, meilleure que Dijkstra sur les graphes clairsemés.
-
-    Paramètres :
-        - graph : le graphe orienté pondéré
-        - source : sommet source
-        - counter : instance d'OperationCounter pour l'instrumentation
-        - vertices : sous-ensemble de sommets à traiter (None = tous)
-        - distances : estimation courante des distances (None = initialisation)
-        - upper_bound : borne supérieure sur les distances à considérer
-        - log_power : puissance de log pour le choix de k (2/3 par défaut, comme dans le papier)
-        - recursion_depth : profondeur de récursion courante (pour éviter les débordements)
-        - max_depth : profondeur maximale de récursion
-
-    Retour :
-        - distances : dictionnaire {sommet: distance minimale estimée depuis la source}
+    Implémentation fidèle de la "frontier reduction" du papier Duan et al. (2025).
     """
-    if vertices is None:
-        vertices = graph.get_vertices()
     if distances is None:
         distances = {v: float('inf') for v in graph.get_vertices()}
         distances[source] = 0.0
+    if S is None:
+        S = {source}
 
-    n = len(vertices)
-    if n <= 1 or recursion_depth > max_depth:
+    n = len(graph.get_vertices())
+    if recursion_depth > max_depth or n <= 1:
         return distances
 
-    # 1. Choisir k = ceil(log(n) ** log_power)
     k = max(2, int(math.ceil(math.log2(n) ** log_power)))
-    # 2. Partitionner les sommets selon leur distance estimée en k intervalles
-    finite_distances = [distances[v] for v in vertices if distances[v] < upper_bound]
-    if not finite_distances:
-        return distances
-    min_dist = min(finite_distances)
-    max_dist = min(upper_bound, max(finite_distances))
-    if max_dist == min_dist:
-        intervals = [vertices]
-    else:
-        interval_size = (max_dist - min_dist) / k
-        intervals = [[] for _ in range(k)]
-        for v in vertices:
-            if distances[v] >= upper_bound:
-                continue
-            idx = min(k - 1, int((distances[v] - min_dist) / interval_size))
-            intervals[idx].append(v)
 
-    # 3. Pour chaque intervalle, faire k passes Bellman-Ford sur les sommets de l’intervalle
-    for group in intervals:
-        for _ in range(k):
-            updated = False
-            for u in group:
+    # 1. Calculer l'ensemble U des sommets à compléter (<B, dépendant d'un pivot)
+    U = set()
+    parent = {}
+    for u in graph.get_vertices():
+        if distances[u] < B:
+            # On cherche un chemin le reliant à un pivot de S
+            for s in S:
+                # BFS limité pour trouver un chemin de s à u
+                queue = deque([(s, 0)])
+                visited = set()
+                found = False
+                while queue and not found:
+                    v, depth = queue.popleft()
+                    if v == u:
+                        found = True
+                        parent[u] = s
+                        break
+                    if depth >= k:
+                        continue
+                    for w, _ in graph.get_neighbors(v):
+                        if w not in visited:
+                            queue.append((w, depth + 1))
+                            visited.add(w)
+                if found:
+                    U.add(u)
+                    break
+
+    # 2. Si |U| > k*|S|, frontier déjà petite
+    if len(U) > k * len(S):
+        # On ne fait rien, frontier déjà réduite
+        return distances
+
+    # 3. Sinon, k passes Bellman-Ford à partir des pivots
+    for _ in range(k):
+        updated = False
+        for s in S:
+            for u in graph.get_vertices():
                 for v, weight in graph.get_neighbors(u):
                     counter.comparisons += 1
                     if distances[u] + weight < distances[v]:
                         counter.relaxations += 1
                         distances[v] = distances[u] + weight
                         updated = True
-            if not updated:
-                break
+        if not updated:
+            break
 
-    # 4. Sélectionner les pivots (sommets avec au moins k descendants dans l’intervalle)
-    # Pour simplifier, on prend les k sommets de plus petite distance dans chaque intervalle
-    pivots = []
-    for group in intervals:
-        group_sorted = sorted(group, key=lambda v: distances[v])
-        pivots.extend(group_sorted[:max(1, len(group_sorted) // k)])
+    # 4. Sélection des nouveaux pivots (ceux qui ont beaucoup de descendants dans U)
+    pivot_count = defaultdict(int)
+    for u in U:
+        if u in parent:
+            pivot_count[parent[u]] += 1
+    new_pivots = {p for p, cnt in pivot_count.items() if cnt >= k}
+    if not new_pivots:
+        return distances
 
-    # 5. Appel récursif sur chaque sous-ensemble défini par les pivots
-    for group in intervals:
-        if not group:
-            continue
-        # upper_bound pour ce sous-ensemble = max distance du groupe
-        group_max = max([distances[v] for v in group])
-        sssp_frontier_reduction(
+    # 5. Récursivité sur chaque sous-ensemble défini par un pivot
+    for p in new_pivots:
+        # On définit B_p comme la plus grande distance des descendants de p dans U
+        B_p = max([distances[u] for u in U if parent.get(u) == p], default=B)
+        sssp_frontier_reduction_paper(
             graph,
-            source,
+            p,
             counter,
-            group,
             distances,
-            upper_bound=group_max,
+            S={p},
+            B=B_p,
             log_power=log_power,
             recursion_depth=recursion_depth + 1,
             max_depth=max_depth
@@ -258,15 +236,19 @@ def sssp_frontier_reduction(
     return distances
 
 def benchmark_algorithms():
-    sizes = [100, 200, 400, 800]
+    # Tailles de graphes exponentielles pour voir l'effet d'échelle
+    sizes = [500, 2000, 5000, 10000, 20000]
     results = []
     for n in sizes:
-        g = generate_random_graph(n, n * 4)
+        print(f"\n--- Benchmark n={n} ---")
+        g = generate_strongly_connected_graph(n, n * 6)  # 6 arêtes par sommet en moyenne
+
         # Dijkstra instrumenté
         counter = OperationCounter()
         start = time.perf_counter()
         dijkstra_instrumented(g, 0, counter)
         elapsed = time.perf_counter() - start
+        print(f"Dijkstra: time={elapsed:.3f}s, comparisons={counter.comparisons}, relaxations={counter.relaxations}")
         results.append({
             "n": n, "algo": "Dijkstra",
             "time": elapsed,
@@ -275,11 +257,13 @@ def benchmark_algorithms():
             "heap_pushes": counter.heap_pushes,
             "heap_pops": counter.heap_pops
         })
+
         # Algo du papier instrumenté (version fidèle)
         counter = OperationCounter()
         start = time.perf_counter()
-        sssp_frontier_reduction(g, 0, counter)
+        sssp_frontier_reduction_paper(g, 0, counter)
         elapsed = time.perf_counter() - start
+        print(f"Frontier Reduction (paper): time={elapsed:.3f}s, comparisons={counter.comparisons}, relaxations={counter.relaxations}")
         results.append({
             "n": n, "algo": "Frontier Reduction (paper)",
             "time": elapsed,
@@ -288,29 +272,40 @@ def benchmark_algorithms():
             "heap_pushes": counter.heap_pushes,
             "heap_pops": counter.heap_pops
         })
+
     # Save results
     df = pd.DataFrame(results)
-    result_dir = os.path.join(os.path.dirname(__file__), "results")
-    os.makedirs(result_dir, exist_ok=True)
-    df.to_csv(os.path.join(result_dir, "benchmark_results.csv"), index=False)
+    df.to_csv("src/results/benchmark_results.csv", index=False)
     # Plot with seaborn
-    metrics = ["time", "comparisons", "relaxations", "heap_pushes", "heap_pops"]
+    metrics = ["time", "comparisons", "relaxations"]
     for metric in metrics:
         plt.figure(figsize=(8, 6))
         sns.lineplot(data=df, x="n", y=metric, hue="algo", marker="o")
         plt.xlabel("Number of vertices")
         plt.ylabel(metric)
         plt.title(f"Dijkstra vs Frontier Reduction SSSP: {metric}")
-        plt.savefig(os.path.join(result_dir, f"benchmark_{metric}.png"))
+        plt.savefig(f"src/results/benchmark_{metric}.png")
         plt.close()
-    # Visualisation graphe + chemin
-    g = generate_random_graph(10, 20)
-    counter = OperationCounter()
-    distances = dijkstra_instrumented(g, 0, counter)
-    target = random.choice([v for v in g.get_vertices() if v != 0])
-    path = get_shortest_path(distances, g, 0, target)
-    draw_graph(g, path, filename=f"src/results/graph_with_shortest_path_{10}.png")
-    print(f"Shortest path from 0 to {target}: {path}")
+    print("\nBenchmarks terminés. Résultats et graphes sauvegardés dans src/results/")
+
+def visualize_multiple_paths(graph, distances, algo_name, source=0, num_targets=5):
+    import random
+    targets = random.sample([v for v in graph.get_vertices() if v != source], min(num_targets, len(graph.get_vertices())-1))
+    for target in targets:
+        path = get_shortest_path(distances, graph, source, target)
+        filename = f"src/results/{algo_name}_shortest_path_{source}_to_{target}.png"
+        draw_graph(graph, path, filename=filename)
+        print(f"{algo_name}: Shortest path {source} → {target} (len={len(path)-1}, dist={distances[target]:.2f}): {path}")
 
 if __name__ == "__main__":
     benchmark_algorithms()
+    # Visualisation dynamique pour un petit graphe
+    g_small = generate_strongly_connected_graph(15, 40)
+    # Dijkstra
+    counter = OperationCounter()
+    dists_dijkstra = dijkstra_instrumented(g_small, 0, counter)
+    visualize_multiple_paths(g_small, dists_dijkstra, "Dijkstra", source=0, num_targets=5)
+    # Frontier Reduction
+    counter = OperationCounter()
+    dists_frontier = sssp_frontier_reduction_paper(g_small, 0, counter)
+    visualize_multiple_paths(g_small, dists_frontier, "FrontierReduction", source=0, num_targets=5)
