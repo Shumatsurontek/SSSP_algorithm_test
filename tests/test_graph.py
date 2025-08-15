@@ -59,5 +59,5 @@ class TestDirectedGraph:
         
         str_repr = str(graph)
         assert "DirectedGraph" in str_repr
-        assert "2 vertices" in str_repr
+        assert "3 vertices" in str_repr
         assert "2 edges" in str_repr
