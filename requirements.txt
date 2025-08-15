@@ -1,0 +1,15 @@
+# Core dependencies
+numpy>=1.24.0
+matplotlib>=3.6.0
+networkx>=3.0
+heapq
+
+# Development and testing
+pytest>=7.0.0
+pytest-benchmark>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Optional: for advanced graph algorithms and visualizations
+scipy>=1.10.0
+plotly>=5.0.0
